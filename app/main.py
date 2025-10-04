@@ -12,7 +12,7 @@ from core.config import load_config
 from utils.utils_column_roles import suggest_roles, small_sample_warning
 from utils.report_pdf import build_fairness_pdf
 
-st.set_page_config("FairAudit v6.2.2 — UX simple", layout="wide")
+st.set_page_config("AuditIA", layout="wide")
 cfg = load_config()
 TH = {
     "DI": cfg["THRESHOLD_DI"],
@@ -26,8 +26,8 @@ TH = {
 Path(f"{cfg['APP_PROJECT_DIR']}/demo").mkdir(parents=True, exist_ok=True)
 
 # ===== Modo RR.HH. (simple) + estilos =====
-st.title("📊 FairAudit — Auditoría de Equidad (v6.2.2)")
-st.caption("Paso a paso. Sin jerga. Todo automático.")
+st.title("📊 AuditIA")
+st.caption("Auditoría de Equidad")
 hr_mode = st.toggle("👩‍💼 Modo RR.HH. (simple)", value=True, help="Oculta detalles técnicos y deja solo lo esencial.")
 st.markdown("""
 <style>
