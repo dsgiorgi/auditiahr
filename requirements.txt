@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+scikit-learn
+shap
+matplotlib
+pydantic
+python-dotenv
+reportlab
+openpyxl
+rapidfuzz
+Unidecode
+plotly
