@@ -28,7 +28,7 @@ Path(f"{cfg['APP_PROJECT_DIR']}/demo").mkdir(parents=True, exist_ok=True)
 # ===== Modo RR.HH. (simple) + estilos =====
 st.title("📊 AuditIA")
 st.caption("Auditoría de Equidad")
-hr_mode = st.toggle("👩‍💼 Modo RR.HH. (simple)", value=True, help="Oculta detalles técnicos y deja solo lo esencial.")
+hr_mode = st.toggle("👩‍💼 Modo RR.HH.", value=True, help="Oculta detalles técnicos y deja solo lo esencial.")
 st.markdown("""
 <style>
 h1, h2, h3 { margin-bottom: .4rem; }
