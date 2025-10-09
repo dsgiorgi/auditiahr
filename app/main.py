@@ -1,5 +1,4 @@
-
-import sys
+import sys, os, requests, io as pyio
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -11,6 +10,56 @@ from core import io, fairness, validate, explain, heuristics, nlg
 from core.config import load_config
 from utils.utils_column_roles import suggest_roles, small_sample_warning
 from utils.report_pdf import build_fairness_pdf
+
+# === NUEVO: Configurar endpoint de Azure Function (opcional) ===
+ANON_API_URL = os.getenv("ANON_API_URL", "").strip()  # p.ej.: https://auditiahr-func.azurewebsites.net/api/anon-upload
+ANON_API_KEY = os.getenv("ANON_API_KEY", "").strip()  # si tu Function requiere key
+
+def upload_and_anon_in_azure(file_obj, filename: str) -> bytes:
+    """
+    Envía el archivo a la Azure Function que anonimiza y (opcionalmente) guarda en Blob.
+    Debe devolver bytes del CSV anonimizado para seguir el flujo local.
+    """
+    if not ANON_API_URL:
+        raise RuntimeError("ANON_API_URL no configurada")
+
+    headers = {}
+    if ANON_API_KEY:
+        headers["x-functions-key"] = ANON_API_KEY
+
+    files = {
+        "file": (filename, file_obj, "text/csv" if filename.lower().endswith(".csv") else "application/octet-stream")
+    }
+
+    # Si tu Function espera algún parámetro adicional, agrégalo aquí:
+    data = {
+        # "container": "anon-data"  # ejemplo si tu endpoint lo usa
+    }
+
+    resp = requests.post(ANON_API_URL, headers=headers, files=files, data=data, timeout=60)
+    resp.raise_for_status()
+
+    # La Function puede:
+    # 1) retornar CSV anonimizado como bytes (application/octet-stream o text/csv)
+    # 2) retornar JSON con { "csv_base64": "..."} o { "blob_url": "..." }
+    ctype = resp.headers.get("content-type", "")
+    if "text/csv" in ctype or "octet-stream" in ctype:
+        return resp.content
+
+    # Si vino JSON con csv_base64
+    try:
+        j = resp.json()
+        if "csv_base64" in j:
+            import base64
+            return base64.b64decode(j["csv_base64"])
+        elif "blob_url" in j:
+            # Descargar desde Blob si el endpoint devuelve URL (SAS)
+            csv_bytes = requests.get(j["blob_url"], timeout=60).content
+            return csv_bytes
+    except Exception:
+        pass
+
+    raise RuntimeError("La Function no devolvió un CSV válido")
 
 st.set_page_config("AuditIA", layout="wide")
 cfg = load_config()
@@ -108,16 +157,46 @@ mode = st.radio("Elegí una opción:", ["Un archivo con etapas", "Varios archivo
 df = None
 f = None
 
+# === NUEVO: switch para usar Azure Function si está disponible ===
+use_cloud_default = bool(ANON_API_URL)
+use_cloud = False
+if use_cloud_default:
+    use_cloud = st.toggle("☁️ Procesar en Azure (recomendado)", value=True,
+                          help="Anonimiza/sube el archivo en tu backend seguro de Azure. Si falla, se usará el modo local.")
+
 if mode == "Un archivo con etapas":
     f = st.file_uploader("Subí tu archivo (CSV/XLSX)", type=["csv","xlsx"])
     if f:
-        df, mapping, _ = io.read_any(f)
-        st.success("✅ Archivo cargado.")
-        if not hr_mode:
-            st.dataframe(df.head(8), use_container_width=True)
+        try:
+            if use_cloud:
+                with st.spinner("Enviando a Azure para anonimizar..."):
+                    csv_bytes = upload_and_anon_in_azure(f, f.name)
+                # leer CSV anonimizado
+                df = pd.read_csv(pyio.BytesIO(csv_bytes))
+                mapping, _ = io.smart_map_columns(df)
+                st.success("✅ Archivo procesado en Azure y cargado.")
+                if not hr_mode:
+                    st.dataframe(df.head(8), use_container_width=True)
+            else:
+                # Flujo local existente
+                df, mapping, _ = io.read_any(f)
+                st.success("✅ Archivo cargado.")
+                if not hr_mode:
+                    st.dataframe(df.head(8), use_container_width=True)
+        except Exception as e:
+            st.error(f"No se pudo procesar en Azure ({e}). Se intentará modo local.")
+            try:
+                df, mapping, _ = io.read_any(f)
+                st.success("✅ Archivo cargado (modo local).")
+                if not hr_mode:
+                    st.dataframe(df.head(8), use_container_width=True)
+            except Exception as e2:
+                st.error(f"Error leyendo el archivo localmente: {e2}")
 else:
     files = st.file_uploader("Subí uno o más archivos (CSV/XLSX)", type=["csv","xlsx"], accept_multiple_files=True)
     if files:
+        if use_cloud:
+            st.info("Para múltiples archivos, hoy se usa el flujo local y luego podés descargar el CSV preparado. Si querés, subí el consolidado en una sola carga para usar Azure.")
         labels = []
         opts = ["Detectar automáticamente","preselection","interview","offer","hire"]
         for ff in files:
