@@ -1,4 +1,4 @@
-# FairAudit – v6.2.2
+# AuditIA
 - UX simple sin sidebar.
 - Auto detección de columnas sensibles (ES/EN + categóricas).
 - KPIs DI/DP/EO con narrativa clara.
