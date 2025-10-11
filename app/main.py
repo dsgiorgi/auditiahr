@@ -1,5 +1,4 @@
-
-import sys
+import sys, os, io, base64, json, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -7,11 +6,86 @@ if str(ROOT) not in sys.path:
 
 import streamlit as st, pandas as pd, numpy as np
 import plotly.express as px
+import requests
+
+# ==== Config y módulos de tu proyecto ====
 from core import io, fairness, validate, explain, heuristics, nlg
 from core.config import load_config
 from utils.utils_column_roles import suggest_roles, small_sample_warning
 from utils.report_pdf import build_fairness_pdf
 
+# --------------------------------------------------------------------------------------
+#  Helpers: llamar a Azure Function SIEMPRE y obtener un DataFrame ANONIMIZADO
+# --------------------------------------------------------------------------------------
+def _read_csv_bytes(csv_bytes: bytes) -> pd.DataFrame:
+    # lee csv robusto en mem (utf-8 con BOM ok)
+    bio = io.BytesIO(csv_bytes) if hasattr(io, "BytesIO") else None
+    if bio is None:
+        import io as _pyio
+        bio = _pyio.BytesIO(csv_bytes)
+    return pd.read_csv(bio)
+
+def _df_from_function_response(resp: requests.Response) -> pd.DataFrame:
+    ctype = resp.headers.get("Content-Type", "")
+    # CSV directo
+    if "text/csv" in ctype or "application/octet-stream" in ctype:
+        return _read_csv_bytes(resp.content)
+    # JSON con csv_b64 o preview
+    data = resp.json()
+    if "csv_b64" in data and data["csv_b64"]:
+        csv_bytes = base64.b64decode(data["csv_b64"])
+        return _read_csv_bytes(csv_bytes)
+    if "preview" in data and isinstance(data["preview"], list):
+        # fallback: solo preview (limitado). Lo avisamos claro al usuario.
+        df = pd.DataFrame(data["preview"])
+        st.warning("Se recibió solo una **muestra** (preview) desde Azure (no CSV completo). El análisis puede ser parcial.")
+        return df
+    raise ValueError("La Function no devolvió CSV ni 'csv_b64'/'preview' válidos.")
+
+def process_in_azure(file_obj, filename: str) -> pd.DataFrame:
+    """
+    Envía SIEMPRE el archivo a la Azure Function definida en ANON_API_URL.
+    - Espera CSV anonimizado como respuesta (ideal) o JSON con csv_b64 / preview.
+    - Si la Function requiere clave, lee ANON_API_KEY de secrets/env.
+    """
+    # 1) Endpoint y key
+    api_url = os.getenv("ANON_API_URL") or st.secrets.get("ANON_API_URL", None)
+    if not api_url:
+        st.error("Falta configurar **ANON_API_URL** en el entorno/secrets. Ej: https://<tu-func>.azurewebsites.net/api/anon-upload")
+        st.stop()
+    api_key = os.getenv("ANON_API_KEY") or st.secrets.get("ANON_API_KEY", None)
+
+    # 2) Bytes
+    file_bytes = file_obj.read() if hasattr(file_obj, "read") else file_obj
+    if not file_bytes:
+        raise ValueError("El archivo está vacío o no se pudo leer.")
+
+    # 3) POST -> Azure
+    params = {"filename": filename or f"upload_{int(time.time())}.xlsx"}
+    headers = {"Content-Type": "application/octet-stream"}
+    if api_key:
+        # Para authLevel=function: se puede pasar ?code= o header x-functions-key
+        # Preferimos header si el host lo acepta:
+        headers["x-functions-key"] = api_key
+
+    r = requests.post(api_url, params=params, headers=headers, data=file_bytes, timeout=120)
+    if r.status_code != 200:
+        # Intenta leer mensaje de error
+        try:
+            msg = r.text
+        except Exception:
+            msg = f"status={r.status_code}"
+        raise RuntimeError(f"Azure Function respondió error: {msg}")
+
+    # 4) Construir DataFrame anonimizado
+    df = _df_from_function_response(r)
+    if df is None or df.empty:
+        raise ValueError("La Function devolvió un dataset vacío.")
+    return df
+
+# --------------------------------------------------------------------------------------
+#  UI & Lógica de tu app (igual que tu main, reemplazando la carga local por Azure)
+# --------------------------------------------------------------------------------------
 st.set_page_config("AuditIA", layout="wide")
 cfg = load_config()
 TH = {
@@ -22,7 +96,7 @@ TH = {
     "EO_YELLOW": cfg["THRESHOLD_EO_YELLOW"]
 }
 
-# Garantiza carpeta de salida para exportaciones
+# Carpeta para exportaciones
 Path(f"{cfg['APP_PROJECT_DIR']}/demo").mkdir(parents=True, exist_ok=True)
 
 # ===== Modo RR.HH. (simple) + estilos =====
@@ -61,8 +135,6 @@ def kpi_status_box(di, dp, eo, th, low_sample=False):
             st.error(f"🔴 Brecha importante entre calificados (EO={eo:.2f}).")
 
 def hr_explanations(df, outcome_col, features, max_items=5):
-    import numpy as np
-    import pandas as pd
     bullets = []
     for feat in features:
         if feat == outcome_col or feat not in df.columns:
@@ -96,11 +168,12 @@ def hr_explanations(df, outcome_col, features, max_items=5):
 
 with st.expander("¿Qué necesito?", expanded=False):
     st.markdown("""
-**Archivos**: CSV/Excel (un consolidado con etapa o varios por etapa).
+**Archivos**: CSV/Excel.  
 **Columnas**:
 - **Resultado final** (0 = no avanza, 1 = avanza).
-- (Opcional) **¿Realmente calificado?** para igualdad de oportunidades.
+- (Opcional) **¿Realmente calificado?** (para EO).
 - **Datos personales** (Género, Edad, País). Se detectan **automáticamente**.
+**Privacidad**: el archivo se **anonimiza en Azure** antes de cualquier análisis.
 """)
 
 st.header("1) Cargar datos")
@@ -108,28 +181,40 @@ mode = st.radio("Elegí una opción:", ["Un archivo con etapas", "Varios archivo
 df = None
 f = None
 
+# === SIEMPRE CLOUD ===
 if mode == "Un archivo con etapas":
     f = st.file_uploader("Subí tu archivo (CSV/XLSX)", type=["csv","xlsx"])
     if f:
-        df, mapping, _ = io.read_any(f)
-        st.success("✅ Archivo cargado.")
+        with st.spinner("Anonimizando en Azure..."):
+            df = process_in_azure(f, f.name)
+        st.success("✅ Procesado en Azure. Datos recibidos ya **anonimizados**.")
+        # (si querés mostrar muestra técnica, destildá el HR mode)
         if not hr_mode:
             st.dataframe(df.head(8), use_container_width=True)
 else:
     files = st.file_uploader("Subí uno o más archivos (CSV/XLSX)", type=["csv","xlsx"], accept_multiple_files=True)
     if files:
-        labels = []
         opts = ["Detectar automáticamente","preselection","interview","offer","hire"]
+        labels = []
         for ff in files:
             lab = st.selectbox(f"Etapa para **{ff.name}**", options=opts, key=f"name_{ff.name}")
             labels.append(None if lab=="Detectar automáticamente" else lab)
-        df = io.merge_files_with_stages(list(zip(files, labels)))
-        if df is not None:
-            st.success("✅ Archivos combinados.")
+
+        # Procesar cada archivo en Azure y concatenar
+        dfs = []
+        with st.spinner("Anonimizando todos los archivos en Azure..."):
+            for ff, lab in zip(files, labels):
+                dfi = process_in_azure(ff, ff.name)
+                if lab:
+                    dfi["stage"] = lab
+                dfs.append(dfi)
+        if dfs:
+            df = pd.concat(dfs, ignore_index=True)
+            st.success("✅ Archivos procesados en Azure y combinados.")
             if not hr_mode:
                 st.dataframe(df.head(8), use_container_width=True)
 
-# >>> Header de Paso 2 solo si hay archivo
+# >>> Paso 2 en adelante: tu flujo original
 if df is not None and not df.empty:
     st.header("2) Confirmar columnas")
     mapping, _ = io.smart_map_columns(df)
@@ -144,9 +229,8 @@ if df is not None and not df.empty:
     with c2:
         stage_col = st.selectbox("Etapa (opcional)", ["(ninguna)"] + cols,
             index=(cols.index(mapping.get("stage"))+1) if mapping.get("stage") in cols else 0)
-        if st.checkbox("Anonimizar emails/teléfonos/documentos/ids"):
-            df = io.anonymize(df)
-            st.success("🔒 Anonimización aplicada al dataset en memoria.")
+        # quitamos opción de anonimizar local para evitar confusiones:
+        st.caption("🔒 La anonimización ya se aplicó en Azure antes del análisis.")
 
     if "edad" in df.columns:
         with st.expander("Opcional: agrupar EDAD en rangos (recomendado)", expanded=True):
@@ -198,9 +282,9 @@ if df is not None and not df.empty:
             bloquear.add(stage_col)
 
         for c in df.columns:
-            if c in bloquear: 
+            if c in bloquear:
                 continue
-            if roles.get(c) in {"id","notes","stage"}: 
+            if roles.get(c) in {"id","notes","stage"}:
                 continue
             nunq = df[c].nunique(dropna=True)
             if 1 < nunq <= 10 and c not in candidatos:
@@ -318,7 +402,10 @@ if df is not None and not df.empty:
 
         st.divider()
         st.header("4) Factores que más influyen (global)")
-        auto_features, roles = heuristics.suggest_features(df, outcome_col=outcome_col, y_true_col=y_true_col if y_true_col!="(ninguna)" else None)
+        auto_features, roles = heuristics.suggest_features(
+            df, outcome_col=outcome_col,
+            y_true_col=y_true_col if y_true_col!="(ninguna)" else None
+        )
         auto_features = [c for c in auto_features if df[c].nunique(dropna=True) >= 2]
 
         if not hr_mode:
@@ -362,7 +449,6 @@ if df is not None and not df.empty:
 
         # ----- 5) Descargas -----
         st.header("5) Descargas")
-
         from datetime import datetime
         csv_name = f"dataset_preparado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
@@ -377,7 +463,7 @@ if df is not None and not df.empty:
         st.subheader("Informe PDF")
         if st.button("📄 Generar informe para RR.HH. (PDF)"):
             meta = {
-                "dataset_name": getattr(f, 'name', 'dataset'),
+                "dataset_name": getattr(f, 'name', 'dataset') if 'f' in locals() else 'dataset',
                 "rows": int(df.shape[0]),
                 "cols": int(df.shape[1]),
                 "sensitive_cols": cols_a_usar,
