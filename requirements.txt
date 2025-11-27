@@ -11,3 +11,9 @@ openpyxl
 rapidfuzz
 Unidecode
 plotly
+
+fairlearn
+azure-identity
+azure-keyvault-secrets
+azure-storage-blob
+opencensus-ext-azure
