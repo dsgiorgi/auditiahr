@@ -14,6 +14,11 @@ from core.config import load_config
 from utils.utils_column_roles import suggest_roles, small_sample_warning
 from utils.report_pdf import build_fairness_pdf
 
+from utils import blob_storage
+import uuid
+
+from core.io import load_dataset, anonymize
+
 # --------------------------------------------------------------------------------------
 #  Helpers: llamar a Azure Function SIEMPRE y obtener un DataFrame ANONIMIZADO
 # --------------------------------------------------------------------------------------
@@ -186,7 +191,54 @@ if mode == "Un archivo con etapas":
     f = st.file_uploader("Subí tu archivo (CSV/XLSX)", type=["csv","xlsx"])
     if f:
         with st.spinner("Anonimizando en Azure..."):
-            df = process_in_azure(f, f.name)
+            df = None
+
+if files_mode == "archivo_unico":
+    uploaded = st.file_uploader("Subí un archivo (CSV/XLSX)", type=["csv","xlsx"])
+    if uploaded:
+        raw_df = io.load_dataset(uploaded)
+        if raw_df is None or raw_df.empty:
+            st.error("No se pudo leer el archivo.")
+        else:
+            df = anonymize(raw_df)
+            # Guardar copia anonimizada en Blob Storage
+            blob_name = f"datasets/{uuid.uuid4()}.csv"
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            try:
+                blob_url = blob_storage.upload_bytes(blob_name, csv_bytes, content_type="text/csv")
+                st.session_state["current_blob_name"] = blob_name
+                if not hr_mode:
+                    st.info(f"Dataset anonimizado almacenado temporalmente en Blob: {blob_name}")
+            except Exception as e:
+                st.warning(f"No se pudo guardar en Blob Storage (se continúa en memoria). Detalle: {e}")
+            if not hr_mode:
+                st.dataframe(df.head(8), use_container_width=True)
+else:
+    files = st.file_uploader("Subí uno o más archivos (CSV/XLSX)", type=["csv","xlsx"], accept_multiple_files=True)
+    if files:
+        dfs = []
+        for ff in files:
+            raw_df = io.load_dataset(ff)
+            if raw_df is None or raw_df.empty:
+                st.warning(f"No se pudo leer {ff.name}, se omite.")
+                continue
+            tmp = anonymize(raw_df)
+            # etiquetar etapa según UI (igual que antes)
+            # ...
+            dfs.append(tmp)
+        if dfs:
+            df = pd.concat(dfs, ignore_index=True)
+            blob_name = f"datasets/{uuid.uuid4()}.csv"
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            try:
+                blob_url = blob_storage.upload_bytes(blob_name, csv_bytes, content_type="text/csv")
+                st.session_state["current_blob_name"] = blob_name
+                if not hr_mode:
+                    st.info(f"Dataset combinado anonimizado almacenado en Blob: {blob_name}")
+            except Exception as e:
+                st.warning(f"No se pudo guardar en Blob Storage (se continúa en memoria). Detalle: {e}")
+            if not hr_mode:
+                st.dataframe(df.head(8), use_container_width=True)
         st.success("✅ Procesado en Azure. Datos recibidos ya **anonimizados**.")
         # (si querés mostrar muestra técnica, destildá el HR mode)
         if not hr_mode:
@@ -468,6 +520,12 @@ if df is not None and not df.empty:
                 "cols": int(df.shape[1]),
                 "sensitive_cols": cols_a_usar,
                 "thresholds": {"di_threshold": 0.8, "alpha": 0.05}
+                blob_name = st.session_state.get("current_blob_name")
+                if blob_name:
+                    try:
+                        blob_storage.delete_blob(blob_name)
+                    except Exception:
+                        pass
             }
             out_path = f"{cfg['APP_PROJECT_DIR']}/demo/reporte_completo_v622.pdf"
 
@@ -484,3 +542,5 @@ if df is not None and not df.empty:
             with open(out_path, "rb") as fpdf:
                 st.download_button("⬇️ Descargar informe RR.HH. (PDF)", fpdf, file_name="reporte_completo_v622.pdf")
             st.success(f"PDF generado en: {out_path}")
+
+            
