@@ -29,6 +29,11 @@ ai_conn = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
 if ai_conn:
     logger.addHandler(AzureLogHandler(connection_string=ai_conn))
 
+logger.info("dataset_loaded", extra={"custom_dimensions": {
+    "n_rows": int(len(df)),
+    "n_cols": int(df.shape[1]),
+    "hr_mode": bool(hr_mode),
+}})
 
 # --------------------------------------------------------------------------------------
 #  Helpers: llamar a Azure Function SIEMPRE y obtener un DataFrame ANONIMIZADO
