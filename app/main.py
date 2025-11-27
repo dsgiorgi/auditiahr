@@ -19,6 +19,17 @@ import uuid
 
 from core.io import load_dataset, anonymize
 
+import logging
+from opencensus.ext.azure.log_exporter import AzureLogHandler
+
+logger = logging.getLogger("auditiahr")
+logger.setLevel(logging.INFO)
+
+ai_conn = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+if ai_conn:
+    logger.addHandler(AzureLogHandler(connection_string=ai_conn))
+
+
 # --------------------------------------------------------------------------------------
 #  Helpers: llamar a Azure Function SIEMPRE y obtener un DataFrame ANONIMIZADO
 # --------------------------------------------------------------------------------------
