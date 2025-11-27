@@ -1,6 +1,8 @@
 
 import os, logging, re, pandas as pd
 from .config import load_config
+import hashlib
+from utils.kv_client import get_secret
 try:
     from rapidfuzz import fuzz; HAVE_RAPIDFUZZ=True
 except: HAVE_RAPIDFUZZ=False
@@ -19,6 +21,7 @@ TARGETS = {
     "nationality":{"syns":["nacionalidad","nationality","pais","país","origen","country"]}
 }
 _WORD_RE = re.compile(r"[a-z0-9]+")
+SALT_SECRET_NAME = os.getenv("SALT_SECRET_NAME", "AuditIAHR-Salt")
 def _norm(s):
     if s is None: return ""
     s=str(s).strip().lower()
@@ -56,12 +59,32 @@ def merge_files_with_stages(files_and_labels):
         frames.append(tmp)
     if not frames: return None
     return pd.concat(frames, ignore_index=True)
+def _get_salt() -> str:
+    """
+    Obtiene la sal criptográfica desde Azure Key Vault.
+    Si falla (modo local), usa una sal de desarrollo desde variable de entorno.
+    """
+    try:
+        return get_secret(SALT_SECRET_NAME)
+    except Exception:
+        return os.getenv("DEV_FALLBACK_SALT", "DEV_ONLY_STATIC_SALT")
 def anonymize(df, columns=("email","phone","dni","document","ssn","id","Email","Telefono")):
-    out=df.copy()
-    import hashlib, pandas as pd
+    """
+    Aplica hashing irreversible SHA-256 con sal a identificadores directos,
+    tal como está descripto en el PDF.
+
+    - No se alteran columnas que no existan.
+    - La sal se obtiene desde Azure Key Vault.
+    """
+    out = df.copy()
+    salt = _get_salt()
     for c in columns:
         if c in out.columns:
-            out[c]=out[c].astype(str).apply(lambda x: hashlib.sha256(x.encode()).hexdigest()[:10] if pd.notna(x) else x)
+            out[c] = out[c].astype(str).apply(
+                lambda x: hashlib.sha256(f"{salt}|{x}".encode("utf-8")).hexdigest()[:16]
+                if pd.notna(x) and x != ""
+                else x
+            )
     return out
 def export_dataset(df, path):
     os.makedirs(os.path.dirname(path), exist_ok=True); df.to_csv(path, index=False)
